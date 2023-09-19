@@ -9,3 +9,4 @@ tmp/
 /target
 Cargo.lock
 manual-test.sh
+out
