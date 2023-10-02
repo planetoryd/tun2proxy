@@ -18,7 +18,7 @@ use smoltcp::{
     time::Instant,
     wire::{IpCidr, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket, UDP_HEADER_LEN},
 };
-use socks5_impl::protocol::{Address, StreamOperation, UdpHeader, UserKey};
+use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
 use std::collections::LinkedList;
 #[cfg(target_family = "unix")]
 use std::os::unix::io::AsRawFd;
@@ -56,8 +56,7 @@ impl ConnectionInfo {
     fn to_named(&self, name: String) -> Self {
         let mut result = self.clone();
         result.dst = Address::from((name, result.dst.port()));
-        // let p = self.protocol;
-        // log::trace!("{p} replace dst \"{}\" -> \"{}\"", self.dst, result.dst);
+        log::trace!("{} replace dst \"{}\" -> \"{}\"", self.protocol, self.dst, result.dst);
         result
     }
 }
@@ -68,31 +67,25 @@ impl std::fmt::Display for ConnectionInfo {
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub(crate) enum IncomingDirection {
     FromServer,
     FromClient,
 }
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub(crate) enum OutgoingDirection {
     ToServer,
     ToClient,
 }
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub(crate) enum Direction {
     Incoming(IncomingDirection),
     Outgoing(OutgoingDirection),
 }
 
-#[allow(dead_code)]
-pub(crate) enum ConnectionEvent<'a> {
-    NewConnection(&'a ConnectionInfo),
-    ConnectionClosed(&'a ConnectionInfo),
-}
-
-#[derive(Debug)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct DataEvent<'a, T> {
     pub(crate) direction: T,
     pub(crate) buffer: &'a [u8],
@@ -183,22 +176,22 @@ const UDP_ASSO_TIMEOUT: u64 = 10; // seconds
 const DNS_PORT: u16 = 53;
 
 struct ConnectionState {
-    smoltcp_handle: Option<SocketHandle>,
+    smoltcp_handle: SocketHandle,
     mio_stream: TcpStream,
     token: Token,
-    tcp_proxy_handler: Box<dyn TcpProxy>,
+    proxy_handler: Box<dyn ProxyHandler>,
     close_state: u8,
     wait_read: bool,
     wait_write: bool,
+    origin_dst: SocketAddr,
     udp_acco_expiry: Option<::std::time::Instant>,
     udp_socket: Option<UdpSocket>,
     udp_token: Option<Token>,
-    origin_dst: SocketAddr,
     udp_data_cache: LinkedList<Vec<u8>>,
-    udp_over_tcp_expiry: Option<::std::time::Instant>,
+    dns_over_tcp_expiry: Option<::std::time::Instant>,
 }
 
-pub(crate) trait TcpProxy {
+pub(crate) trait ProxyHandler {
     fn get_connection_info(&self) -> &ConnectionInfo;
     fn push_data(&mut self, event: IncomingDataEvent<'_>) -> Result<(), Error>;
     fn consume_data(&mut self, dir: OutgoingDirection, size: usize);
@@ -210,14 +203,14 @@ pub(crate) trait TcpProxy {
 }
 
 pub(crate) trait ConnectionManager {
-    fn new_tcp_proxy(&self, info: &ConnectionInfo, udp_associate: bool) -> Result<Box<dyn TcpProxy>>;
-    fn close_connection(&self, info: &ConnectionInfo);
+    fn new_proxy_handler(&self, info: &ConnectionInfo, udp_associate: bool) -> Result<Box<dyn ProxyHandler>>;
     fn get_server_addr(&self) -> SocketAddr;
-    fn get_credentials(&self) -> &Option<UserKey>;
 }
 
 const TUN_TOKEN: Token = Token(0);
-const EXIT_TOKEN: Token = Token(2);
+const PIPE_TOKEN: Token = Token(1);
+const EXIT_TRIGGER_TOKEN: Token = Token(2);
+const EXIT_TOKEN: Token = Token(10);
 
 pub struct TunToProxy<'a> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -228,15 +221,15 @@ pub struct TunToProxy<'a> {
     iface: Interface,
     connection_map: HashMap<ConnectionInfo, ConnectionState>,
     connection_manager: Option<Rc<dyn ConnectionManager>>,
-    next_token: usize,
+    next_token_seed: usize,
     sockets: SocketSet<'a>,
     device: VirtualTunDevice,
     options: Options,
     write_sockets: HashSet<Token>,
     #[cfg(target_family = "unix")]
-    _exit_receiver: mio::unix::pipe::Receiver,
+    exit_receiver: mio::unix::pipe::Receiver,
     #[cfg(target_family = "unix")]
-    exit_sender: mio::unix::pipe::Sender,
+    exit_trigger: Option<mio::unix::pipe::Sender>,
 }
 
 impl<'a> TunToProxy<'a> {
@@ -260,15 +253,18 @@ impl<'a> TunToProxy<'a> {
             .register(&mut SourceFd(&tun.as_raw_fd()), TUN_TOKEN, Interest::READABLE)?;
 
         #[cfg(target_family = "unix")]
-        let (exit_sender, mut exit_receiver) = mio::unix::pipe::new()?;
+        let (mut exit_trigger, mut exit_receiver) = mio::unix::pipe::new()?;
+
+        #[cfg(target_family = "unix")]
+        poll.registry()
+            .register(&mut exit_trigger, EXIT_TRIGGER_TOKEN, Interest::WRITABLE)?;
         #[cfg(target_family = "unix")]
         poll.registry()
             .register(&mut exit_receiver, EXIT_TOKEN, Interest::READABLE)?;
 
         #[cfg(target_family = "unix")]
-        #[rustfmt::skip]
         let config = match tun.capabilities().medium {
-            Medium::Ethernet => Config::new(smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into()),
+            Medium::Ethernet => Config::new(smoltcp::wire::EthernetAddress([0x02, 0, 0, 0, 0, 0x01]).into()),
             Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
             Medium::Ieee802154 => todo!(),
         };
@@ -297,24 +293,23 @@ impl<'a> TunToProxy<'a> {
             poll,
             iface,
             connection_map: HashMap::default(),
-            next_token: usize::from(EXIT_TOKEN) + 1,
+            next_token_seed: usize::from(EXIT_TOKEN),
             connection_manager: None,
             sockets: SocketSet::new([]),
             device,
             options,
             write_sockets: HashSet::default(),
             #[cfg(target_family = "unix")]
-            _exit_receiver: exit_receiver,
+            exit_receiver,
             #[cfg(target_family = "unix")]
-            exit_sender,
+            exit_trigger: Some(exit_trigger),
         };
         Ok(tun)
     }
 
     fn new_token(&mut self) -> Token {
-        let token = Token(self.next_token);
-        self.next_token += 1;
-        token
+        self.next_token_seed += 1;
+        Token(self.next_token_seed)
     }
 
     pub(crate) fn set_connection_manager(&mut self, manager: Option<Rc<dyn ConnectionManager>>) {
@@ -360,15 +355,14 @@ impl<'a> TunToProxy<'a> {
     /// Destroy connection state machine
     fn remove_connection(&mut self, info: &ConnectionInfo) -> Result<(), Error> {
         if let Some(mut state) = self.connection_map.remove(info) {
-            _ = state.mio_stream.shutdown(Shutdown::Both);
-            if let Some(handle) = state.smoltcp_handle {
+            self.expect_smoltcp_send()?;
+
+            {
+                let handle = state.smoltcp_handle;
                 let socket = self.sockets.get_mut::<tcp::Socket>(handle);
                 socket.close();
                 self.sockets.remove(handle);
             }
-
-            // FIXME: Does this line should be moved up to the beginning of this function?
-            self.expect_smoltcp_send()?;
 
             if let Err(e) = self.poll.registry().deregister(&mut state.mio_stream) {
                 // FIXME: The function `deregister` will frequently fail for unknown reasons.
@@ -379,6 +373,10 @@ impl<'a> TunToProxy<'a> {
                 if let Err(e) = self.poll.registry().deregister(&mut udp_socket) {
                     log::trace!("{}", e);
                 }
+            }
+
+            if let Err(err) = state.mio_stream.shutdown(Shutdown::Both) {
+                log::trace!("Shutdown 0 {} error \"{}\"", info, err);
             }
 
             log::info!("Close {}", info);
@@ -399,30 +397,31 @@ impl<'a> TunToProxy<'a> {
         let mut closed_ends = 0;
         if (state.close_state & SERVER_WRITE_CLOSED) == SERVER_WRITE_CLOSED
             && !state
-                .tcp_proxy_handler
+                .proxy_handler
                 .have_data(Direction::Incoming(IncomingDirection::FromServer))
             && !state
-                .tcp_proxy_handler
+                .proxy_handler
                 .have_data(Direction::Outgoing(OutgoingDirection::ToClient))
         {
-            if let Some(handle) = state.smoltcp_handle {
-                // Close tun interface
-                let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-                socket.close();
-            }
+            // Close tun interface
+            let socket = self.sockets.get_mut::<tcp::Socket>(state.smoltcp_handle);
+            socket.close();
+
             closed_ends += 1;
         }
 
         if (state.close_state & CLIENT_WRITE_CLOSED) == CLIENT_WRITE_CLOSED
             && !state
-                .tcp_proxy_handler
+                .proxy_handler
                 .have_data(Direction::Incoming(IncomingDirection::FromClient))
             && !state
-                .tcp_proxy_handler
+                .proxy_handler
                 .have_data(Direction::Outgoing(OutgoingDirection::ToServer))
         {
             // Close remote server
-            _ = state.mio_stream.shutdown(Shutdown::Write);
+            if let Err(err) = state.mio_stream.shutdown(Shutdown::Write) {
+                log::trace!("Shutdown 1 {} error \"{}\"", info, err);
+            }
             closed_ends += 1;
         }
 
@@ -441,10 +440,7 @@ impl<'a> TunToProxy<'a> {
                 Some(state) => state,
                 None => return Ok(()),
             };
-            let socket = match state.smoltcp_handle {
-                Some(handle) => self.sockets.get_mut::<tcp::Socket>(handle),
-                None => return Ok(()),
-            };
+            let socket = self.sockets.get_mut::<tcp::Socket>(state.smoltcp_handle);
             let mut error = Ok(());
             while socket.can_recv() && error.is_ok() {
                 socket.recv(|data| {
@@ -452,7 +448,7 @@ impl<'a> TunToProxy<'a> {
                         direction: IncomingDirection::FromClient,
                         buffer: data,
                     };
-                    error = state.tcp_proxy_handler.push_data(event);
+                    error = state.proxy_handler.push_data(event);
                     (data.len(), ())
                 })?;
             }
@@ -534,9 +530,9 @@ impl<'a> TunToProxy<'a> {
         if !self.connection_map.contains_key(info) {
             log::info!("DNS over TCP {} ({})", info, origin_dst);
 
-            let tcp_proxy_handler = manager.new_tcp_proxy(info, false)?;
+            let proxy_handler = manager.new_proxy_handler(info, false)?;
             let server_addr = manager.get_server_addr();
-            let state = self.create_new_tcp_connection_state(server_addr, origin_dst, tcp_proxy_handler, false)?;
+            let state = self.create_new_tcp_connection_state(server_addr, origin_dst, proxy_handler, false)?;
             self.connection_map.insert(info.clone(), state);
 
             // TODO: Move this 3 lines to the function end?
@@ -555,47 +551,39 @@ impl<'a> TunToProxy<'a> {
 
         let err = "udp over tcp state not find";
         let state = self.connection_map.get_mut(info).ok_or(err)?;
-        state.udp_over_tcp_expiry = Some(Self::common_udp_life_timeout());
+        state.dns_over_tcp_expiry = Some(Self::common_udp_life_timeout());
 
         let data_event = IncomingDataEvent {
             direction: IncomingDirection::FromClient,
             buffer: &buf,
         };
-        state.tcp_proxy_handler.push_data(data_event)?;
+        state.proxy_handler.push_data(data_event)?;
         Ok(())
     }
 
     fn receive_dns_over_tcp_packet_and_write_to_client(&mut self, info: &ConnectionInfo) -> Result<()> {
         let err = "udp connection state not found";
         let state = self.connection_map.get_mut(info).ok_or(err)?;
-        assert!(state.udp_over_tcp_expiry.is_some());
-        state.udp_over_tcp_expiry = Some(Self::common_udp_life_timeout());
+        assert!(state.dns_over_tcp_expiry.is_some());
+        state.dns_over_tcp_expiry = Some(Self::common_udp_life_timeout());
 
-        // Code similar to the code in parent function. TODO: Cleanup.
-        let mut vecbuf = Vec::<u8>::new();
-        let read_result = state.mio_stream.read_to_end(&mut vecbuf);
-        let read = match read_result {
-            Ok(read_result) => read_result,
-            Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    log::error!("{} Read from proxy: {}", info.dst, error);
-                }
-                vecbuf.len()
-            }
-        };
+        let mut vecbuf = vec![];
+        Self::read_data_from_tcp_stream(&mut state.mio_stream, |data| {
+            vecbuf.extend_from_slice(data);
+            Ok(())
+        })?;
 
-        let data = vecbuf.as_slice();
         let data_event = IncomingDataEvent {
             direction: IncomingDirection::FromServer,
-            buffer: &data[0..read],
+            buffer: &vecbuf,
         };
-        if let Err(error) = state.tcp_proxy_handler.push_data(data_event) {
+        if let Err(error) = state.proxy_handler.push_data(data_event) {
             log::error!("{}", error);
             self.remove_connection(&info.clone())?;
             return Ok(());
         }
 
-        let dns_event = state.tcp_proxy_handler.peek_data(OutgoingDirection::ToClient);
+        let dns_event = state.proxy_handler.peek_data(OutgoingDirection::ToClient);
 
         let mut buf = dns_event.buffer.to_vec();
         let mut to_send: LinkedList<Vec<u8>> = LinkedList::new();
@@ -615,9 +603,7 @@ impl<'a> TunToProxy<'a> {
             let ip = dns::extract_ipaddr_from_dns_message(&message);
             log::trace!("DNS over TCP query result: {} -> {:?}", name, ip);
 
-            state
-                .tcp_proxy_handler
-                .consume_data(OutgoingDirection::ToClient, len + 2);
+            state.proxy_handler.consume_data(OutgoingDirection::ToClient, len + 2);
 
             if !self.options.ipv6_enabled {
                 dns::remove_ipv6_entries(&mut message);
@@ -638,9 +624,9 @@ impl<'a> TunToProxy<'a> {
         Ok(())
     }
 
-    fn udp_over_tcp_timeout_expired(&self, info: &ConnectionInfo) -> bool {
+    fn dns_over_tcp_timeout_expired(&self, info: &ConnectionInfo) -> bool {
         if let Some(state) = self.connection_map.get(info) {
-            if let Some(expiry) = state.udp_over_tcp_expiry {
+            if let Some(expiry) = state.dns_over_tcp_expiry {
                 return expiry < ::std::time::Instant::now();
             }
         }
@@ -650,8 +636,8 @@ impl<'a> TunToProxy<'a> {
     fn clearup_expired_dns_over_tcp(&mut self) -> Result<()> {
         let keys = self.connection_map.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            if self.udp_over_tcp_timeout_expired(&key) {
-                log::trace!("UDP over TCP timeout: {}", key);
+            if self.dns_over_tcp_timeout_expired(&key) {
+                log::trace!("DNS over TCP timeout: {}", key);
                 self.remove_connection(&key)?;
             }
         }
@@ -667,9 +653,9 @@ impl<'a> TunToProxy<'a> {
     ) -> Result<()> {
         if !self.connection_map.contains_key(info) {
             log::info!("UDP associate session {} ({})", info, origin_dst);
-            let tcp_proxy_handler = manager.new_tcp_proxy(info, true)?;
+            let proxy_handler = manager.new_proxy_handler(info, true)?;
             let server_addr = manager.get_server_addr();
-            let state = self.create_new_tcp_connection_state(server_addr, origin_dst, tcp_proxy_handler, true)?;
+            let state = self.create_new_tcp_connection_state(server_addr, origin_dst, proxy_handler, true)?;
             self.connection_map.insert(info.clone(), state);
 
             self.expect_smoltcp_send()?;
@@ -689,7 +675,7 @@ impl<'a> TunToProxy<'a> {
         UdpHeader::new(0, info.dst.clone()).write_to_stream(&mut s5_udp_data)?;
         s5_udp_data.extend_from_slice(payload);
 
-        if let Some(udp_associate) = state.tcp_proxy_handler.get_udp_associate() {
+        if let Some(udp_associate) = state.proxy_handler.get_udp_associate() {
             // UDP associate session has been established, we can send packets directly...
             if let Some(socket) = state.udp_socket.as_ref() {
                 socket.send_to(&s5_udp_data, udp_associate)?;
@@ -702,49 +688,61 @@ impl<'a> TunToProxy<'a> {
         Ok(())
     }
 
+    fn process_incoming_tcp_packets(
+        &mut self,
+        first_packet: bool,
+        manager: &Rc<dyn ConnectionManager>,
+        info: &ConnectionInfo,
+        origin_dst: SocketAddr,
+        frame: &[u8],
+    ) -> Result<()> {
+        if first_packet {
+            let proxy_handler = manager.new_proxy_handler(info, false)?;
+            let server = manager.get_server_addr();
+            let state = self.create_new_tcp_connection_state(server, origin_dst, proxy_handler, false)?;
+            self.connection_map.insert(info.clone(), state);
+
+            log::info!("{} ({})", info, origin_dst);
+        } else if !self.connection_map.contains_key(info) {
+            log::trace!("Drop middle session {} ({})", info, origin_dst);
+            return Ok(());
+        } else {
+            log::trace!("Subsequent packet {} ({})", info, origin_dst);
+        }
+
+        // Inject the packet to advance the remote proxy server smoltcp socket state
+        self.device.inject_packet(frame);
+
+        // Having advanced the socket state, we expect the socket to ACK
+        // Exfiltrate the response packets generated by the socket and inject them
+        // into the tunnel interface.
+        self.expect_smoltcp_send()?;
+
+        // Read from the smoltcp socket and push the data to the connection handler.
+        self.tunsocket_read_and_forward(info)?;
+
+        // The connection handler builds up the connection or encapsulates the data.
+        // Therefore, we now expect it to write data to the server.
+        self.write_to_server(info)?;
+        Ok(())
+    }
+
     // A raw packet was received on the tunnel interface.
     fn receive_tun(&mut self, frame: &mut [u8]) -> Result<(), Error> {
         let mut handler = || -> Result<(), Error> {
             let result = connection_tuple(frame);
             if let Err(error) = result {
-                log::info!("{}, ignored", error);
+                log::debug!("{}, ignored", error);
                 return Ok(());
             }
-            let (info, _first_packet, payload_offset, payload_size) = result?;
+            let (info, first_packet, payload_offset, payload_size) = result?;
             let origin_dst = SocketAddr::try_from(&info.dst)?;
             let info = self.preprocess_origin_connection_info(info)?;
 
             let manager = self.get_connection_manager().ok_or("get connection manager")?;
 
             if info.protocol == IpProtocol::Tcp {
-                if _first_packet {
-                    let tcp_proxy_handler = manager.new_tcp_proxy(&info, false)?;
-                    let server = manager.get_server_addr();
-                    let state = self.create_new_tcp_connection_state(server, origin_dst, tcp_proxy_handler, false)?;
-                    self.connection_map.insert(info.clone(), state);
-
-                    log::info!("Connect done {} ({})", info, origin_dst);
-                } else if !self.connection_map.contains_key(&info) {
-                    // log::debug!("Drop middle session {} ({})", info, origin_dst);
-                    return Ok(());
-                } else {
-                    // log::trace!("Subsequent packet {} ({})", info, origin_dst);
-                }
-
-                // Inject the packet to advance the remote proxy server smoltcp socket state
-                self.device.inject_packet(frame);
-
-                // Having advanced the socket state, we expect the socket to ACK
-                // Exfiltrate the response packets generated by the socket and inject them
-                // into the tunnel interface.
-                self.expect_smoltcp_send()?;
-
-                // Read from the smoltcp socket and push the data to the connection handler.
-                self.tunsocket_read_and_forward(&info)?;
-
-                // The connection handler builds up the connection or encapsulates the data.
-                // Therefore, we now expect it to write data to the server.
-                self.write_to_server(&info)?;
+                self.process_incoming_tcp_packets(first_packet, &manager, &info, origin_dst, frame)?;
             } else if info.protocol == IpProtocol::Udp {
                 let port = info.dst.port();
                 let payload = &frame[payload_offset..payload_offset + payload_size];
@@ -773,7 +771,7 @@ impl<'a> TunToProxy<'a> {
         &mut self,
         server_addr: SocketAddr,
         dst: SocketAddr,
-        tcp_proxy_handler: Box<dyn TcpProxy>,
+        proxy_handler: Box<dyn ProxyHandler>,
         udp_associate: bool,
     ) -> Result<ConnectionState> {
         let mut socket = tcp::Socket::new(
@@ -805,10 +803,10 @@ impl<'a> TunToProxy<'a> {
             (None, None)
         };
         let state = ConnectionState {
-            smoltcp_handle: Some(handle),
+            smoltcp_handle: handle,
             mio_stream: client,
             token,
-            tcp_proxy_handler,
+            proxy_handler,
             close_state: 0,
             wait_read: true,
             wait_write: false,
@@ -817,7 +815,7 @@ impl<'a> TunToProxy<'a> {
             udp_token,
             origin_dst: dst,
             udp_data_cache: LinkedList::new(),
-            udp_over_tcp_expiry: None,
+            dns_over_tcp_expiry: None,
         };
         Ok(state)
     }
@@ -860,7 +858,7 @@ impl<'a> TunToProxy<'a> {
 
     fn write_to_server(&mut self, info: &ConnectionInfo) -> Result<(), Error> {
         if let Some(state) = self.connection_map.get_mut(info) {
-            let event = state.tcp_proxy_handler.peek_data(OutgoingDirection::ToServer);
+            let event = state.proxy_handler.peek_data(OutgoingDirection::ToServer);
             let buffer_size = event.buffer.len();
             if buffer_size == 0 {
                 state.wait_write = false;
@@ -871,19 +869,16 @@ impl<'a> TunToProxy<'a> {
             let result = state.mio_stream.write(event.buffer);
             match result {
                 Ok(written) => {
-                    state
-                        .tcp_proxy_handler
-                        .consume_data(OutgoingDirection::ToServer, written);
+                    state.proxy_handler.consume_data(OutgoingDirection::ToServer, written);
                     state.wait_write = written < buffer_size;
                     Self::update_mio_socket_interest(&mut self.poll, state)?;
                 }
-                Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => {
-                    return Err(error.into());
-                }
-                _ => {
-                    // WOULDBLOCK case
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     state.wait_write = true;
                     Self::update_mio_socket_interest(&mut self.poll, state)?;
+                }
+                Err(error) => {
+                    return Err(error.into());
                 }
             }
         }
@@ -893,24 +888,18 @@ impl<'a> TunToProxy<'a> {
 
     fn write_to_client(&mut self, token: Token, info: &ConnectionInfo) -> Result<(), Error> {
         while let Some(state) = self.connection_map.get_mut(info) {
-            let handle = match state.smoltcp_handle {
-                Some(handle) => handle,
-                None => break,
-            };
-            let event = state.tcp_proxy_handler.peek_data(OutgoingDirection::ToClient);
+            let event = state.proxy_handler.peek_data(OutgoingDirection::ToClient);
             let buflen = event.buffer.len();
             let consumed;
             {
-                let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+                let socket = self.sockets.get_mut::<tcp::Socket>(state.smoltcp_handle);
                 if socket.may_send() {
                     if let Some(virtual_dns) = &mut self.options.virtual_dns {
                         // Unwrapping is fine because every smoltcp socket is bound to an.
                         virtual_dns.touch_ip(&IpAddr::from(socket.local_endpoint().unwrap().addr));
                     }
                     consumed = socket.send_slice(event.buffer)?;
-                    state
-                        .tcp_proxy_handler
-                        .consume_data(OutgoingDirection::ToClient, consumed);
+                    state.proxy_handler.consume_data(OutgoingDirection::ToClient, consumed);
                     self.expect_smoltcp_send()?;
                     if consumed < buflen {
                         self.write_sockets.insert(token);
@@ -941,13 +930,17 @@ impl<'a> TunToProxy<'a> {
         Ok(())
     }
 
+    fn pipe_event(&mut self, _event: &Event) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn send_to_smoltcp(&mut self) -> Result<(), Error> {
         for token in self.write_sockets.clone().into_iter() {
             if let Some(connection) = self.find_info_by_token(token) {
                 let connection = connection.clone();
                 if let Err(error) = self.write_to_client(token, &connection) {
+                    log::error!("Write to client {}", error);
                     self.remove_connection(&connection)?;
-                    log::error!("Write to client: {}: ", error);
                 }
             }
         }
@@ -994,7 +987,7 @@ impl<'a> TunToProxy<'a> {
         // Try to send the first UDP packets to remote SOCKS5 server for UDP associate session
         if let Some(state) = self.connection_map.get_mut(info) {
             if let Some(udp_socket) = state.udp_socket.as_ref() {
-                if let Some(addr) = state.tcp_proxy_handler.get_udp_associate() {
+                if let Some(addr) = state.proxy_handler.get_udp_associate() {
                     // Consume udp_data_cache data
                     while let Some(buf) = state.udp_data_cache.pop_front() {
                         udp_socket.send_to(&buf, addr)?;
@@ -1030,7 +1023,7 @@ impl<'a> TunToProxy<'a> {
                     .connection_map
                     .get(&conn_info)
                     .ok_or("")?
-                    .tcp_proxy_handler
+                    .proxy_handler
                     .connection_established();
                 if self.options.dns_over_tcp && conn_info.dst.port() == DNS_PORT && established {
                     self.receive_dns_over_tcp_packet_and_write_to_client(&conn_info)?;
@@ -1040,34 +1033,31 @@ impl<'a> TunToProxy<'a> {
                     let state = self.connection_map.get_mut(&conn_info).ok_or(e)?;
 
                     // TODO: Move this reading process to its own function.
-                    let mut vecbuf = Vec::<u8>::new();
-                    let read_result = state.mio_stream.read_to_end(&mut vecbuf);
-                    let read = match read_result {
-                        Ok(read_result) => read_result,
-                        Err(error) => {
-                            if error.kind() != std::io::ErrorKind::WouldBlock {
-                                log::error!("{} Read from proxy: {}", conn_info.dst, error);
-                            }
-                            vecbuf.len()
-                        }
-                    };
+                    let mut vecbuf = vec![];
+                    Self::read_data_from_tcp_stream(&mut state.mio_stream, |data| {
+                        vecbuf.extend_from_slice(data);
+                        Ok(())
+                    })?;
 
-                    let data = vecbuf.as_slice();
                     let data_event = IncomingDataEvent {
                         direction: IncomingDirection::FromServer,
-                        buffer: &data[0..read],
+                        buffer: &vecbuf,
                     };
-                    if let Err(error) = state.tcp_proxy_handler.push_data(data_event) {
+                    if let Err(error) = state.proxy_handler.push_data(data_event) {
                         log::error!("{}", error);
                         self.remove_connection(&conn_info.clone())?;
                         return Ok(());
                     }
 
                     // The handler request for reset the server connection
-                    if state.tcp_proxy_handler.reset_connection() {
-                        _ = self.poll.registry().deregister(&mut state.mio_stream);
+                    if state.proxy_handler.reset_connection() {
+                        if let Err(err) = self.poll.registry().deregister(&mut state.mio_stream) {
+                            log::trace!("{}", err);
+                        }
                         // Closes the connection with the proxy
-                        state.mio_stream.shutdown(Shutdown::Both)?;
+                        if let Err(err) = state.mio_stream.shutdown(Shutdown::Both) {
+                            log::trace!("Shutdown 2 error \"{}\"", err);
+                        }
 
                         log::info!("RESET {}", conn_info);
 
@@ -1081,7 +1071,7 @@ impl<'a> TunToProxy<'a> {
                         return Ok(());
                     }
 
-                    if read == 0 || event.is_read_closed() {
+                    if vecbuf.is_empty() || event.is_read_closed() {
                         state.wait_read = false;
                         state.close_state |= SERVER_WRITE_CLOSED;
                         Self::update_mio_socket_interest(&mut self.poll, state)?;
@@ -1113,12 +1103,75 @@ impl<'a> TunToProxy<'a> {
         Ok(())
     }
 
+    fn read_data_from_tcp_stream<F>(stream: &mut TcpStream, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&mut [u8]) -> Result<()>,
+    {
+        let mut tmp: [u8; 4096] = [0_u8; 4096];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => {
+                    // The tcp connection closed
+                    break;
+                }
+                Ok(read_result) => {
+                    callback(&mut tmp[0..read_result])?;
+                }
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        // We have read all available data.
+                        break;
+                    } else if error.kind() == std::io::ErrorKind::Interrupted {
+                        // Hardware or software interrupt, continue polling.
+                        continue;
+                    } else {
+                        return Err(error.into());
+                    }
+                }
+            };
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prepare_exiting_signal_trigger(&mut self) -> Result<()> {
+        let mut exit_trigger = self.exit_trigger.take().ok_or("Already running")?;
+        ctrlc::set_handler(move || {
+            let mut count = 0;
+            loop {
+                match exit_trigger.write(b"EXIT") {
+                    Ok(_) => {
+                        log::trace!("Exit signal triggered successfully");
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if count > 5 {
+                            log::error!("Send exit signal failed 5 times, exit anyway");
+                            std::process::exit(1);
+                        }
+                        log::trace!("Send exit signal failed, retry in 1 second");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        count += 1;
+                    }
+                    Err(err) => {
+                        println!("Failed to send exit signal: \"{}\"", err);
+                        break;
+                    }
+                }
+            }
+        })?;
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<(), Error> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.prepare_exiting_signal_trigger()?;
+
         let mut events = Events::with_capacity(1024);
         loop {
             if let Err(err) = self.poll.poll(&mut events, None) {
                 if err.kind() == std::io::ErrorKind::Interrupted {
-                    log::warn!("Poll interrupted: \"{err}\", ignored, continue polling");
+                    log::debug!("Poll interrupted: \"{err}\", ignored, continue polling");
                     continue;
                 }
                 return Err(err.into());
@@ -1126,10 +1179,16 @@ impl<'a> TunToProxy<'a> {
             for event in events.iter() {
                 match event.token() {
                     EXIT_TOKEN => {
-                        log::info!("Exiting tun2proxy...");
-                        return Ok(());
+                        if self.exiting_event_handler()? {
+                            return Ok(());
+                        }
+                    }
+                    EXIT_TRIGGER_TOKEN => {
+                        #[cfg(target_family = "unix")]
+                        log::trace!("Exiting trigger is ready, {:?}", self.exit_trigger);
                     }
                     TUN_TOKEN => self.tun_event(event)?,
+                    PIPE_TOKEN => self.pipe_event(event)?,
                     _ => self.mio_socket_event(event)?,
                 }
             }
@@ -1139,9 +1198,32 @@ impl<'a> TunToProxy<'a> {
         }
     }
 
+    #[cfg(target_family = "unix")]
+    fn exiting_event_handler(&mut self) -> Result<bool> {
+        let mut buffer = vec![0; 100];
+        match self.exit_receiver.read(&mut buffer) {
+            Ok(size) => {
+                log::trace!("Received exit signal: {:?}", &buffer[..size]);
+                log::info!("Exiting tun2proxy...");
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                log::trace!("Exiting reciever is ready");
+                Ok(false)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn exiting_event_handler(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[cfg(target_family = "unix")]
     pub fn shutdown(&mut self) -> Result<(), Error> {
-        #[cfg(target_family = "unix")]
-        self.exit_sender.write_all(&[1])?;
+        log::debug!("Shutdown tun2proxy...");
+        _ = self.exit_trigger.as_mut().ok_or("Already triggered")?.write(b"EXIT")?;
         Ok(())
     }
 }
